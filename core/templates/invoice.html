@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Invoice {{ p.invoice_no }}</title>
+<style>body{font:15px system-ui;max-width:700px;margin:20px auto;padding:0 14px}table{width:100%;border-collapse:collapse}
+td,th{padding:8px;border-bottom:1px solid #ccc;text-align:left}.r{text-align:right}@media print{button{display:none}}</style>
+<button onclick="print()">Print</button>
+<h2>Tax Invoice</h2>
+<p><b>{{ seller.name }}</b><br>{{ seller.address }}<br>{% if seller.gstin %}GSTIN: {{ seller.gstin }}{% endif %}</p>
+<p>Invoice no: <b>{{ p.invoice_no }}</b><br>Date: {{ p.created_at|date:"d M Y" }}<br>Billed to: {{ p.owner.first_name }} ({{ p.owner.username }})</p>
+<table><tr><th>Description</th><th class="r">Amount (₹)</th></tr>
+<tr><td>LoopRewards {{ p.plan|title }} subscription</td><td class="r">{{ base }}</td></tr>
+<tr><td>GST @ {{ rate }}%</td><td class="r">{{ gst }}</td></tr>
+<tr><th>Total (paid)</th><th class="r">{{ gross }}</th></tr></table>
+<p><small>Payment ref: {{ p.payment_id|default:p.utr }}. Amount is inclusive of GST.</small></p>

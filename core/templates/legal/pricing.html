@@ -1,0 +1,13 @@
+{% extends "legal/base.html" %}{% block title %}Pricing{% endblock %}{% block body %}
+<h1>Pricing</h1>
+<p>Customers use LoopRewards free. Shops start with a <b>{{ trial }}-day free trial</b> (no card needed).</p>
+<table><tr><th>Plan</th><th>Price (incl. {{ gst }}% GST)</th><th>Includes</th></tr>
+<tr><td>Monthly</td><td>₹{{ monthly }} / month</td><td>Shop page, QR and print kit, unlimited rewards and customers, purchase approval, counter code, staff accounts, reports, GST invoice.</td></tr>
+<tr><td>Yearly</td><td>₹{{ yearly }} / year</td><td>Everything in Monthly, billed once a year.</td></tr></table>
+<h2>If you stop, and if you come back</h2>
+<table><tr><th>When</th><th>What happens</th></tr>
+<tr><td>Plan ends</td><td>Shop page and QR pause for customers for {{ grace }} days. Nothing is deleted. You can still log in, print and redeem earned rewards.</td></tr>
+<tr><td>Up to {{ retention }} months after that</td><td>Your data is kept safe. Renew any time and everything returns instantly: same QR, customers, progress and rewards. Customers' reward dates are extended by the paused time. No back-charge.</td></tr>
+<tr><td>After {{ retention }} months</td><td>Shop data is permanently deleted. You can start again with a new shop and QR.</td></tr></table>
+<p>See the <a href="/terms/">Terms</a> and <a href="/refund/">Refund &amp; Cancellation Policy</a>. Pay securely online (UPI, cards, netbanking) or by UPI QR.</p>
+{% endblock %}

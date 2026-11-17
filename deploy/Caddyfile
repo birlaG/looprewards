@@ -1,0 +1,22 @@
+{$DOMAIN} {
+	encode zstd gzip
+	request_body {
+		max_size 10MB
+	}
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+	handle /media/* {
+		root * /srv
+		file_server
+	}
+	handle {
+		reverse_proxy web:8000
+	}
+}
+
+www.{$DOMAIN} {
+	redir https://{$DOMAIN}{uri} permanent
+}

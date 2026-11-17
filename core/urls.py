@@ -1,0 +1,33 @@
+from django.urls import path
+from . import extras as ex, reports as rp, views as v, billing as b, vendors as vd
+
+urlpatterns = [
+    path("auth/register/", v.register),
+    path("auth/login/", v.login),
+    path("owner/businesses/", v.my_businesses),
+    path("businesses/", v.create_business),
+    path("b/<str:code>/", v.public_business),
+    path("b/<str:code>/qr.png", v.business_qr),
+    path("b/<str:code>/regenerate-qr/", v.regenerate_qr),
+    path("b/<str:code>/programs/", v.create_program),
+    path("b/<str:code>/join/", v.join),
+    path("b/<str:code>/staff/", v.staff),
+    path("b/<str:code>/counter-code/", v.counter_code),
+    path("b/<str:code>/cqr.png", v.counter_qr),
+    path("entries/", v.submit_entry),
+    path("owner/pending/", v.pending),
+    path("entries/<int:pk>/review/", v.review),
+    path("rewards/redeem/", v.redeem),
+    path("me/shops/", v.my_shops),
+    path("b/<str:code>/report/", rp.report),
+    path("notifications/", rp.notifications), path("notifications/read/", rp.notifications_read),
+    path("vendor/apply/", vd.apply), path("vendor/dashboard/", vd.dashboard), path("vendor/assist/", vd.assist),
+    path("auth/change-password/", vd.change_password),
+    path("b/<str:code>/settings/", ex.business_settings), path("programs/<int:pk>/", ex.program_update),
+    path("tasks/<int:pk>/", ex.task_update), path("entries/<int:pk>/reverse/", ex.reverse), path("owner/recent/", ex.recent),
+    path("b/<str:code>/customers/<int:pid>/block/", ex.block), path("b/<str:code>/broadcast/", ex.broadcast),
+    path("me/", ex.delete_me), path("auth/reset/request/", ex.otp_request), path("auth/reset/confirm/", ex.otp_confirm),
+    path("admin/stats/", ex.admin_stats), path("auth/accept/", ex.accept_terms), path("billing/autopay/", b.autopay), path("billing/autopay/cancel/", b.autopay_cancel),
+    path("billing/", b.status), path("billing/order/", b.create_order), path("billing/verify/", b.verify),
+    path("billing/webhook/", b.webhook), path("billing/upi/", b.upi_submit), path("billing/upi-qr.png", b.upi_qr),
+]

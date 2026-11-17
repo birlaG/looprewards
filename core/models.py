@@ -1,0 +1,264 @@
+import secrets, string
+from django.contrib.auth.models import AbstractUser
+from django.db import models
+
+
+def new_shop_code():
+    return "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+
+
+def new_reward_code():
+    return secrets.token_hex(4).upper()
+
+
+def _bill_path(instance, filename):  # unguessable file names
+    import os, uuid
+    return f"bills/{uuid.uuid4().hex}{os.path.splitext(filename)[1][:6]}"
+
+
+class User(AbstractUser):  # username == mobile number
+    ROLES = [("owner", "owner"), ("staff", "staff"), ("customer", "customer")]
+    role = models.CharField(max_length=10, choices=ROLES, default="customer")
+
+
+class Business(models.Model):
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name="businesses")
+    name = models.CharField(max_length=120)
+    category = models.CharField(max_length=30, default="other")
+    tagline = models.CharField(max_length=160, blank=True)
+    address = models.TextField(blank=True)
+    lat = models.FloatField(null=True, blank=True)
+    lng = models.FloatField(null=True, blank=True)
+    hours = models.CharField(max_length=120, blank=True)
+    language = models.CharField(max_length=5, default="en")
+    pay_upi_id = models.CharField(max_length=80, blank=True)
+    pay_qr_image = models.ImageField(upload_to="payqr/", blank=True)
+    shop_code = models.CharField(max_length=12, unique=True, default=new_shop_code)  # regenerate = revoke QR
+    status = models.CharField(max_length=12, default="active")  # active / paused (subscription gate)
+    approval_mode = models.CharField(max_length=10, default="manual", choices=[("manual", "manual"), ("auto", "auto")])
+    cooldown_minutes = models.PositiveIntegerField(default=10)
+    daily_cap = models.PositiveIntegerField(default=3)
+
+    def __str__(self):
+        return self.name
+
+
+class Program(models.Model):
+    business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name="programs")
+    title = models.CharField(max_length=120)
+    active = models.BooleanField(default=True)
+    start = models.DateField(null=True, blank=True)
+    end = models.DateField(null=True, blank=True)
+
+
+class Task(models.Model):
+    TYPES = [("count", "count"), ("amount", "amount"), ("visit", "visit")]
+    program = models.ForeignKey(Program, on_delete=models.CASCADE, related_name="tasks")
+    title = models.CharField(max_length=120)
+    type = models.CharField(max_length=10, choices=TYPES)
+    target = models.DecimalField(max_digits=10, decimal_places=2)
+    item_name = models.CharField(max_length=80, blank=True)
+    repeatable = models.BooleanField(default=True)
+    max_per_customer = models.PositiveIntegerField(default=0)  # 0 = unlimited when repeatable
+    version = models.PositiveIntegerField(default=1)
+
+
+class Reward(models.Model):
+    TYPES = [("free_item", "free_item"), ("percent_off", "percent_off"), ("flat_off", "flat_off"),
+             ("gift", "gift"), ("custom", "custom")]
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="rewards")
+    title = models.CharField(max_length=120)
+    type = models.CharField(max_length=12, choices=TYPES)
+    value = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    expiry_days = models.PositiveIntegerField(default=30)
+    terms = models.TextField(blank=True)
+
+
+class CustomerProfile(models.Model):  # one global login, separate profile per business
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="profiles")
+    business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name="customers")
+    status = models.CharField(max_length=10, default="active")  # active / blocked
+    joined_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("user", "business")
+
+
+class PurchaseEntry(models.Model):
+    profile = models.ForeignKey(CustomerProfile, on_delete=models.CASCADE, related_name="entries")
+    task = models.ForeignKey(Task, on_delete=models.CASCADE)
+    value = models.DecimalField(max_digits=10, decimal_places=2, default=1)  # qty or amount
+    status = models.CharField(max_length=10, default="pending")  # pending/approved/rejected
+    bill_photo = models.ImageField(upload_to=_bill_path, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+
+
+class TaskProgress(models.Model):
+    profile = models.ForeignKey(CustomerProfile, on_delete=models.CASCADE, related_name="progress")
+    task = models.ForeignKey(Task, on_delete=models.CASCADE)
+    current_value = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    completed_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        unique_together = ("profile", "task")
+
+
+class RewardGrant(models.Model):
+    profile = models.ForeignKey(CustomerProfile, on_delete=models.CASCADE, related_name="grants")
+    reward = models.ForeignKey(Reward, on_delete=models.CASCADE)
+    code = models.CharField(max_length=12, unique=True, default=new_reward_code)
+    status = models.CharField(max_length=10, default="active")  # active/used/expired
+    issued_at = models.DateTimeField(auto_now_add=True)
+    redeemed_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField()
+
+
+class AuditLog(models.Model):
+    business = models.ForeignKey(Business, on_delete=models.CASCADE)
+    actor = models.ForeignKey(User, null=True, on_delete=models.SET_NULL)
+    action = models.CharField(max_length=40)
+    ref = models.CharField(max_length=60, blank=True)
+    at = models.DateTimeField(auto_now_add=True)
+
+
+from datetime import timedelta
+from django.conf import settings
+from django.utils import timezone
+
+
+class Subscription(models.Model):
+    owner = models.OneToOneField(User, on_delete=models.CASCADE, related_name="subscription")
+    trial_ends = models.DateTimeField()
+    paid_until = models.DateTimeField(null=True, blank=True)
+
+    @property
+    def state(self):
+        now = timezone.now()
+        end = self.paid_until or self.trial_ends
+        if now <= end:
+            return "active" if self.paid_until else "trial"
+        return "grace" if now <= end + timedelta(days=settings.GRACE_DAYS) else "expired"
+
+
+class Payment(models.Model):
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name="payments")
+    plan = models.CharField(max_length=10)
+    amount = models.PositiveIntegerField()  # paise
+    method = models.CharField(max_length=10)  # gateway / upi
+    status = models.CharField(max_length=10, default="created")  # created/pending/paid/rejected
+    order_id = models.CharField(max_length=60, blank=True, db_index=True)
+    payment_id = models.CharField(max_length=60, blank=True)
+    utr = models.CharField(max_length=20, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+def get_sub(owner):
+    return Subscription.objects.get_or_create(
+        owner=owner, defaults={"trial_ends": timezone.now() + timedelta(days=settings.TRIAL_DAYS)})[0]
+
+
+def _sub_state(self):
+    return get_sub(self.owner).state
+
+
+def _is_live(self):  # public profile + earning allowed only in trial/active
+    return self.status == "active" and self.sub_state in ("trial", "active")
+
+
+Business.sub_state = property(_sub_state)
+Business.is_live = property(_is_live)
+
+
+class ReminderLog(models.Model):  # dedupe: one reminder per owner/kind/period
+    owner = models.ForeignKey(User, on_delete=models.CASCADE)
+    kind = models.CharField(max_length=20)
+    key = models.CharField(max_length=20)
+    sent_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("owner", "kind", "key")
+
+
+Payment.add_to_class("invoice_no", models.CharField(max_length=24, blank=True))
+
+
+class Vendor(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="vendor")
+    code = models.CharField(max_length=10, unique=True)
+    rate = models.DecimalField(max_digits=5, decimal_places=2, default=20)  # % of ex-GST subscription, set by admin
+    pan = models.CharField(max_length=10)
+    upi_id = models.CharField(max_length=80)
+    status = models.CharField(max_length=10, default="pending")  # pending/approved/suspended
+
+    def __str__(self):
+        return f"{self.code} ({self.user.username})"
+
+
+class Payout(models.Model):
+    vendor = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name="payouts")
+    amount = models.PositiveIntegerField()  # paise, before TDS
+    status = models.CharField(max_length=10, default="pending")  # pending/paid
+    reference = models.CharField(max_length=60, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class Commission(models.Model):
+    payment = models.OneToOneField(Payment, on_delete=models.CASCADE)
+    vendor = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name="commissions")
+    rate = models.DecimalField(max_digits=5, decimal_places=2)
+    amount = models.PositiveIntegerField()  # paise
+    status = models.CharField(max_length=10, default="hold")  # hold/payable/paid/reversed
+    payable_on = models.DateTimeField()
+    payout = models.ForeignKey(Payout, null=True, blank=True, on_delete=models.SET_NULL)
+
+
+# permanent attribution, set once at registration
+User.add_to_class("referred_by", models.ForeignKey(Vendor, null=True, blank=True, on_delete=models.SET_NULL,
+                                                   related_name="referrals"))
+
+
+class StaffMember(models.Model):  # staff: approve + redeem only
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="staff_of")
+    business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name="staff")
+
+
+class CodeUse(models.Model):  # a counter code works once per customer, and only N times per step
+    business = models.ForeignKey(Business, on_delete=models.CASCADE)
+    step = models.BigIntegerField()
+    profile = models.ForeignKey(CustomerProfile, on_delete=models.CASCADE)
+
+    class Meta:
+        unique_together = ("business", "step", "profile")
+
+
+def can_manage(user, biz):
+    return user.id == biz.owner_id or StaffMember.objects.filter(user=user, business=biz).exists()
+
+
+class Notification(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="notifications")
+    text = models.CharField(max_length=240)
+    read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+Business.add_to_class("require_bill_photo", models.BooleanField(default=False))
+Business.add_to_class("max_distance_m", models.PositiveIntegerField(default=300))
+CustomerProfile.add_to_class("marketing_consent", models.BooleanField(default=False))
+PurchaseEntry.add_to_class("far", models.BooleanField(default=False))
+PurchaseEntry.add_to_class("distance_m", models.IntegerField(null=True, blank=True))
+TaskProgress.add_to_class("target", models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True))  # snapshot
+Subscription.add_to_class("rzp_sub_id", models.CharField(max_length=40, blank=True))
+
+
+class OtpCode(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    code_hash = models.CharField(max_length=64)
+    expires = models.DateTimeField()
+    attempts = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+User.add_to_class("consent_at", models.DateTimeField(null=True, blank=True))  # when Terms/Privacy were accepted
