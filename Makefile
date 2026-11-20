@@ -1,19 +1,19 @@
 .PHONY: deploy rollback backup logs ps shell superuser migrations-local test-local
 deploy:
-	./deploy/deploy.sh
+	bash ./deploy/deploy.sh
 rollback:
-	./deploy/rollback.sh
+	bash ./deploy/rollback.sh
 backup:
-	./deploy/backup.sh
+	bash ./deploy/backup.sh
 logs:
-	docker compose logs -f --tail=100 web
+	sudo journalctl -u firaao -f --no-pager
 ps:
-	docker compose ps
+	systemctl status firaao --no-pager
 shell:
-	docker compose exec web python manage.py shell
+	set -a; . ./.env; set +a; ./venv/bin/python manage.py shell
 superuser:
-	docker compose exec web python manage.py createsuperuser
+	set -a; . ./.env; set +a; ./venv/bin/python manage.py createsuperuser
 migrations-local:
-	docker run --rm -v "$(PWD)":/app -w /app -e DEBUG=1 python:3.12-slim sh -c "pip install -q -r requirements.txt && python manage.py makemigrations core"
+	DEBUG=1 ./venv/bin/python manage.py makemigrations core
 test-local:
-	docker run --rm -v "$(PWD)":/app -w /app -e DEBUG=1 python:3.12-slim sh -c "pip install -q -r requirements.txt && python manage.py test"
+	DEBUG=1 ./venv/bin/python manage.py test

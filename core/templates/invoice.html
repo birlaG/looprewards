@@ -7,7 +7,7 @@ td,th{padding:8px;border-bottom:1px solid #ccc;text-align:left}.r{text-align:rig
 <p><b>{{ seller.name }}</b><br>{{ seller.address }}<br>{% if seller.gstin %}GSTIN: {{ seller.gstin }}{% endif %}</p>
 <p>Invoice no: <b>{{ p.invoice_no }}</b><br>Date: {{ p.created_at|date:"d M Y" }}<br>Billed to: {{ p.owner.first_name }} ({{ p.owner.username }})</p>
 <table><tr><th>Description</th><th class="r">Amount (₹)</th></tr>
-<tr><td>LoopRewards {{ p.plan|title }} subscription</td><td class="r">{{ base }}</td></tr>
+<tr><td>Firaao {{ p.plan|title }} subscription</td><td class="r">{{ base }}</td></tr>
 <tr><td>GST @ {{ rate }}%</td><td class="r">{{ gst }}</td></tr>
 <tr><th>Total (paid)</th><th class="r">{{ gross }}</th></tr></table>
 <p><small>Payment ref: {{ p.payment_id|default:p.utr }}. Amount is inclusive of GST.</small></p>

@@ -1,159 +1,286 @@
-# LoopRewards – Contabo deployment & operations guide
+# Firaao: Contabo VPS deployment (no Docker)
 
-Stack on ONE server (Docker): **Caddy** (HTTPS, files) → **Django/gunicorn** (app + API + PWA) → **PostgreSQL** + **Redis**, plus a **cron** container (reminders, payouts). Everything is started by one command: `./deploy/deploy.sh`.
+This deployment runs Django/Gunicorn, PostgreSQL, systemd, and Nginx directly on Ubuntu. It does not install or use Docker. The instructions below assume the domain is `firaao.shop` and use Ubuntu 24.04 LTS.
 
-> Honest note: this kit was written and syntax-checked, but I could not run Docker or Razorpay where I built it. Do the **pilot checklist (section 7)** on a test domain before real customers.
+> **Important for a VPS that already runs another project:** never stop its services, change its firewall/SSH rules, or install a second reverse proxy on ports 80/443. First identify what owns those ports. The Nginx commands below are for an existing host-installed Nginx or a VPS with unused web ports. If the existing proxy is Caddy, Apache, or a Docker container, stop after step 1 and adapt the proxy configuration instead of following the Nginx install/configuration commands blindly.
 
----
-## 1. What you need first
-| Item | Why |
-|---|---|
-| Domain name (e.g. looprewards.in) | HTTPS, QR codes point here. **Never change it later** – printed QRs carry it. |
-| Contabo VPS, Ubuntu 24.04 | the server |
-| GitHub account (private repo) | where your code lives; server pulls updates from it |
-| Razorpay account (KYC done) | online payments + auto-renew |
-| SMS/WhatsApp provider | OTP + alerts (optional at first) |
-| A laptop with Docker **or** Python 3.12 | to create migrations before the first deploy |
+## 1. Check the existing Contabo server and DNS
 
-## 2. Choose the server (Contabo)
-Check Contabo's current plans/prices on their site. For launch with real shops pick **at least 4 vCPU, 8 GB RAM, SSD ≥ 100 GB**, region near India users if available, **Ubuntu 24.04**, and **add your SSH key at order time**. Contabo plans are cheap per resource; speed can vary between neighbours, so monitor (section 9) and keep backups offsite (section 8).
-Rough capacity (an *estimate*, not measured – load-test before a big launch): one such server should handle a few thousand shops and a few hundred thousand registered customers at normal daily traffic. Section 10 shows how to grow past that.
-`docker-compose.yml` Postgres settings are tuned for 8 GB; for other sizes set `shared_buffers` ≈ 25% RAM and `effective_cache_size` ≈ 60% RAM.
+At Contabo, make sure inbound TCP ports 80 and 443 are allowed by the VPS firewall. Do not change existing firewall policies just to follow this guide. Add DNS records at your DNS provider:
 
-## 3. One-time prep on your laptop
-```bash
-# unzip the project, then:
-git init && git add . && git commit -m "first version"
-# create an empty PRIVATE repo on GitHub, then:
-git remote add origin git@github.com:YOU/looprewards.git && git branch -M main && git push -u origin main
-```
-**Create the database migrations (required once, commit them):**
-```bash
-make migrations-local          # needs Docker. Without Docker: pip install -r requirements.txt; DEBUG=1 python manage.py makemigrations core
-git add core/migrations && git commit -m "migrations" && git push
-make test-local                # run the tests; fix anything that fails BEFORE deploying
-```
-(The server refuses to start without committed migrations – this protects your data.)
-
-## 4. Prepare the server
-1. In your domain DNS add **A records**: `yourdomain.com` → SERVER_IP and `www` → SERVER_IP. Use plain DNS (not a CDN proxy) at first.
-2. From your laptop: `ssh-copy-id root@SERVER_IP` (skip if you added the key at order time).
-3. `scp deploy/setup-server.sh root@SERVER_IP:/root/ && ssh root@SERVER_IP "bash /root/setup-server.sh"`
-   It installs Docker, firewall (only SSH/80/443), fail2ban, automatic security updates, swap, and a `deploy` user; it disables password login.
-4. **Open a new terminal** and check `ssh deploy@SERVER_IP` works before closing the first one.
-
-## 5. First deploy
-```bash
-ssh deploy@SERVER_IP
-ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 && cat ~/.ssh/id_ed25519.pub
-#   -> GitHub repo > Settings > Deploy keys > Add (read-only)
-git clone git@github.com:YOU/looprewards.git && cd looprewards
-cp .env.example .env && nano .env        # fill every CHANGE line
-#   secrets: openssl rand -base64 48     (use for SECRET_KEY and POSTGRES_PASSWORD)
-make deploy                               # builds, migrates, starts, health-checks
-make superuser                            # your admin login
-```
-Open `https://yourdomain.com/admin` (Caddy gets the HTTPS certificate automatically; takes a minute the first time). The app is at `https://yourdomain.com/app/`.
-
-## 6. Connect the money and messages
-- **Razorpay:** put `RAZORPAY_KEY_ID/SECRET` in `.env`. Dashboard → Webhooks → URL `https://yourdomain.com/api/billing/webhook/`, set a secret (same as `RAZORPAY_WEBHOOK_SECRET`), events: `payment.captured`, `order.paid`, `subscription.charged`. For auto-renew create a Monthly and a Yearly plan (Subscriptions → Plans) and put their ids in `.env`.
-- **Your UPI:** `PLATFORM_UPI_ID` for the "pay by QR" option; approve those payments in `/admin → Payments`.
-- **SMS/WhatsApp:** `NOTIFY_WEBHOOK_URL` = a small endpoint of yours that receives `{"mobile","text"}` and calls your provider. Set `NOTIFY_SMS=1` for reward alerts.
-- After editing `.env`: `docker compose up -d` (restarts changed services).
-
-## 7. Pilot checklist (do on test domain, then with 10–20 real shops)
-- [ ] Register owner → create shop → publish reward → print A6 card (also Hindi)
-- [ ] Customer scans QR on a phone → registers → "I purchased" → owner approves → progress moves → reward code → redeem
-- [ ] Counter-code screen: customer scans and gets instant approval; far-away entry is flagged
-- [ ] Razorpay **test mode** payment, then webhook arrives (check `/admin → Payments` shows paid + invoice opens)
-- [ ] Auto-renew in test mode; cancel works
-- [ ] UPI-QR payment + admin approve
-- [ ] Agent signs up, you approve, referral shop pays, commission appears in `/admin → Commissions`
-- [ ] Forgot-password OTP, delete account
-- [ ] `docker compose restart web` – the app comes back; run `make backup` and a test restore on a spare machine
-- [ ] Legal pages: fill the legal block in `.env`, open `/privacy/ /terms/ /refund/ /pricing/ /contact/`, read them once, **have a lawyer review**, then give those URLs to Razorpay
-
-## 8. Updating (every future change)
-```
-laptop:  change code → make test-local → git commit → git push        (GitHub runs the tests too)
-         changed models?  make migrations-local → commit core/migrations too
-server:  cd ~/looprewards && make deploy
-```
-`make deploy` = pull latest → automatic backup → rebuild → restart → health check. Users see a few seconds of interruption.
-- Problem after deploy? `make rollback` returns to the previous code (migrations are not undone; for a bad data migration restore the backup).
-- Add features in small releases; never edit files directly on the server.
-- Safe migration habit: add new columns/tables first (nullable), deploy; remove old ones in a later release.
-
-**Backups** (set once): `crontab -e` as `deploy`, add
-`15 3 * * * cd /home/deploy/looprewards && ./deploy/backup.sh >> backups/backup.log 2>&1`
-It keeps 14 days locally. **Local backups die with the server** – also copy offsite: install `rclone`, configure Contabo Object Storage (S3) or any cloud, set `RCLONE_REMOTE=remote:bucket` in `.env`.
-Restore DB: `./deploy/restore.sh backups/db-DATE.dump`. Restore uploads: `docker run --rm -v looprewards_media:/m -v $PWD/backups:/b alpine tar xzf /b/media-DATE.tgz -C /m`. **Test a restore once a month.**
-
-## 9. Monitoring (free)
-- UptimeRobot/BetterStack: monitor `https://yourdomain.com/healthz`, alert to your phone.
-- Errors: create a free Sentry project, put the DSN in `SENTRY_DSN`.
-- Look: `make ps`, `make logs`, `docker stats`, `df -h` (disk), `free -h`.
-- Weekly: check `/api/admin/stats/` (staff token) – shops, subscription states, 30-day revenue; check Payments "pending" UPI approvals and Payouts due on the 1st.
-
-## 10. Growing to a large market (in this order)
-1. **Cloudflare in front** (DDoS/caching): switch DNS proxy on, SSL mode *Full (strict)*, set `NUM_PROXIES=2` in `.env`.
-2. **Bigger server** (resize in Contabo) – cheapest first step; raise `WEB_WORKERS` (≈ vCPU) and Postgres memory settings.
-3. **Move the database off the app server** (second VPS or managed Postgres); point `POSTGRES_HOST` to it; keep nightly dumps.
-4. **Uploaded files to object storage** (S3-compatible) before running more than one app server (add `django-storages`).
-5. **Several app servers** behind a load balancer (Caddy/HAProxy or Contabo LB); run the `cron` container on **one** server only.
-6. **Queue for messages and heavy jobs** (Celery/RQ with the Redis you have): SMS currently goes via a background thread that is lost if the container restarts; reports are computed live and should be cached/pre-computed for shops with very large histories.
-7. Postgres read replica for reports; consider partitioning `PurchaseEntry` when it passes hundreds of millions of rows.
-Before each step: load-test (k6/Locust) the scan → login → "I purchased" → approve flow.
-
-## 11. Security checklist
-- [ ] `DEBUG=0`, long random `SECRET_KEY`, strong DB password (app refuses to start otherwise)
-- [ ] Firewall: only 22/80/443 (Postgres/Redis are not exposed); SSH keys only
-- [ ] `.env` never in git; Razorpay keys only in `.env`
-- [ ] Admin: strong password, create only the staff you need; log in at `/admin` only over HTTPS
-- [ ] Rate limits on login/OTP are on (need Redis – already in compose)
-- [ ] Contabo snapshot before big changes; offsite backups on
-- [ ] Privacy policy + consent wording reviewed by a lawyer (DPDP); GST invoice format by your CA; agent commission/TDS by your CA
-
-## 12. Launching to many shops – practical plan
-1. **Pilot** 10–20 shops in one area (PRD open question 4): free trial, visit weekly, fix friction.
-2. **Agents** drive growth: approve them, set commission, give each their link `https://yourdomain.com/app/?ref=CODE`; agents can register a shop for an owner on the spot and print the counter card.
-3. Per area: aim for density (many shops in one market) so customers see QR everywhere – then repeat in the next area.
-4. Weekly: read the report numbers (repeat rate, rewards redeemed), talk to the 3 worst and best shops.
-5. Keep a support WhatsApp number on the print card/app (add to the card text) – owners are low-tech.
-
-## 13. Troubleshooting
-| Symptom | Check |
-|---|---|
-| Site not loading / no HTTPS | DNS A record correct? ports 80/443 open? `docker compose logs caddy` |
-| `core/migrations is missing` | do section 3 (migrations), push, `make deploy` |
-| 400 "Bad Request" | `ALLOWED_HOSTS` / `CSRF_TRUSTED_ORIGINS` in `.env` match your domain |
-| Payments not activating | Razorpay webhook URL/secret/events; `docker compose logs web | grep billing` |
-| Everyone gets "throttled" | `NUM_PROXIES` wrong (1 without Cloudflare, 2 with) |
-| Disk filling | `docker system df`, `backups/` size, old images: `docker image prune -a` |
-| Restart everything | `docker compose up -d` (data is safe in volumes) |
-
-## 14. File map
-`docker-compose.yml` services · `Dockerfile` app image · `deploy/Caddyfile` HTTPS/proxy · `deploy/*.sh` setup, deploy, rollback, backup, restore · `Makefile` shortcuts · `.env.example` all settings · `.github/workflows/test.yml` automatic tests · `core/` the app (models, services, billing, vendors, reports, web/app.html PWA) · `config/` Django settings.
-
-## 15. Subscription lifecycle – a shop pays 1 month, stops, returns after 3–4 months
-| When | What the system does | What the owner / customers see |
+| Type | Name | Value |
 |---|---|---|
-| Day 0–14 | Free trial (once per owner) | Everything works |
-| Pays Monthly | Active for 30 days, invoice created, agent commission on hold 30 days | Everything works |
-| Day 30, not renewed | **Pause period (30 days):** shop page + QR show "paused", nobody can earn. **Nothing is deleted.** Owner can still log in, print card, see reports, and **redeem rewards already earned** | Owner gets reminders at expiry, day 7, day 25 |
-| Day 60 | **Expired:** QR + print kit disabled; data kept for `RETENTION_MONTHS` (default 12) | Win-back messages at ~2 and ~5 months after pause, final notice 30 days before deletion |
-| **Returns at month 3–4** and pays any plan | Active again **immediately**: same shop code (old printed QRs work), programs, customers, progress and rewards all back. Period starts from the payment day (no back-charge). Customers' unredeemed rewards get their expiry **extended by the paused time**. No second free trial. Owner gets a "Welcome back" notice | Everything as before |
-| Returns after 12+ months | Data was permanently deleted by `purge_lapsed`; the owner starts a new shop with a new QR | Told in advance by the final-notice message |
+| A | `@` | Your Contabo VPS IPv4 address |
+| A | `www` | Your Contabo VPS IPv4 address |
 
-How to run it professionally:
-- **Win-back calls:** `/admin → Subscriptions`, sort by `paid_until` – lapsed shops are your warmest leads for agents.
-- **Agent commission after a return:** the shop stays attributed to the original agent and commission is paid on the new payment (set `COMMISSION_FIRST_YEAR_ONLY=1` if you want only year one).
-- **Auto-renew failures:** if Razorpay stops charging (card/UPI limit), the owner gets "auto-renew failed" and the plan lapses as above; they can renew in one tap.
-- **Deletion is safe by default:** `purge_lapsed` only *prints* what it would delete. Review the daily log (`docker compose logs cron`), and when you are comfortable set `AUTO_PURGE=1` in `.env` (then `docker compose up -d`). Your Privacy Policy promises this deletion, so enable it before you have shops older than 13+ months.
-- Change the numbers in `.env` (`RETENTION_MONTHS`) and `config/settings.py` (`TRIAL_DAYS`, `GRACE_DAYS`, `PLANS`); the legal and pricing pages update automatically.
+If you are not routing IPv6 to this VPS, remove any `AAAA` records for these names. Wait for DNS to resolve before requesting TLS certificates.
 
-## 16. Legal pages (Razorpay + DPDP)
-- Pages: `/privacy/`, `/terms/`, `/refund/`, `/pricing/`, `/contact/` – linked in the app footer; registration requires ticking agreement (the time is stored per user); owners created by an agent are asked to accept at first login; marketing offers need a separate opt-in.
-- Set in `.env`: `SELLER_NAME`, `SELLER_ADDRESS`, `SUPPORT_EMAIL`, `SUPPORT_PHONE`, `GRIEVANCE_NAME/EMAIL`, `JURISDICTION`, `HOSTING_REGION`, `LEGAL_UPDATED`.
-- These are **templates written to match what the app really does** (data it stores, retention, deletion, the refund rules). I am not a lawyer: have a lawyer check them and adjust the refund rules (the 7-day yearly refund and liability cap are suggestions, edit `core/templates/legal/`), and update `LEGAL_UPDATED` when you change them. If you add a new data type or third party, update the privacy page first.
-- Razorpay account review usually wants: business details, contact page, pricing, Terms, Privacy, Refund/Cancellation – all present at the URLs above.
+SSH into the VPS and inspect it before installing anything:
+
+```bash
+ssh root@YOUR_CONTABO_VPS_IP
+ss -ltnp | grep -E ':(22|80|443|8000|18080)\b' || true
+systemctl is-active nginx || true
+systemctl is-active caddy || true
+systemctl is-active apache2 || true
+free -h
+df -h
+```
+
+Keep the current project running. If ports 80 or 443 belong to a non-Nginx proxy (including a proxy inside a container), do **not** install or enable another proxy; get the current proxy type/configuration and adapt its site routing first. Firaao's Gunicorn listens only on `127.0.0.1:18080` by default; change `APP_BIND_PORT` in `.env` and the Nginx upstream if that port is in use.
+
+## 2. Install native Ubuntu packages
+
+Run as root, or prefix these commands with `sudo` from an administrator account. This installs packages but does not change firewall or SSH configuration:
+
+```bash
+apt update
+apt install -y git curl python3 python3-venv python3-dev build-essential \
+  libpq-dev postgresql postgresql-contrib nginx certbot python3-certbot-nginx
+```
+
+If Nginx was already installed for the other site, keep its existing configuration. Do not overwrite its default site or restart unrelated applications.
+
+Create a deployment account and a separate, unprivileged app-service account. Choose a strong password for the deployment account when prompted; it is used for `sudo`:
+
+```bash
+adduser deploy
+usermod -aG sudo deploy
+useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group firaao
+usermod -aG firaao,www-data deploy
+install -d -m 755 -o deploy -g deploy /srv/firaao
+```
+
+Add your laptop's SSH public key for `deploy` (use your actual key path if different), then test a **new terminal** before continuing:
+
+```bash
+install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+nano /home/deploy/.ssh/authorized_keys
+chown deploy:deploy /home/deploy/.ssh/authorized_keys
+chmod 600 /home/deploy/.ssh/authorized_keys
+```
+
+Paste your laptop's `.pub` key as the complete contents of `authorized_keys`. From Windows PowerShell, display it with `Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub` (generate one first with `ssh-keygen -t ed25519` if needed). From your laptop:
+
+```bash
+ssh deploy@YOUR_CONTABO_VPS_IP
+```
+
+Do not disable root/password SSH or modify firewall rules as part of this app deployment.
+
+## 3. Create the PostgreSQL database
+
+On the VPS, connect as `deploy` and set a database password (save it for `.env`):
+
+```bash
+sudo -u postgres createuser --pwprompt --no-createdb --no-superuser --no-createrole firaao
+sudo -u postgres createdb --owner=firaao firaao
+```
+
+Use the password you entered below as `POSTGRES_PASSWORD`. PostgreSQL stays on the server and is not exposed publicly.
+
+## 4. Clone Firaao and configure it
+
+Create a **read-only deploy key** on GitHub and add its public key under the repository's **Settings → Deploy keys**. Then, on the VPS as `deploy`:
+
+```bash
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub
+```
+
+Add the displayed key to the private GitHub repository as a read-only deploy key, then:
+
+```bash
+git clone git@github.com:birlaG/looprewards.git /srv/firaao/looprewards
+cd /srv/firaao/looprewards
+cp .env.example .env
+chmod 600 .env
+nano .env
+```
+
+Replace the `CHANGE` values. At minimum configure:
+
+- `SECRET_KEY`: generate with `openssl rand -hex 32` and paste the output.
+- `POSTGRES_PASSWORD`: the password created in step 3.
+- `SELLER_NAME`, `SELLER_ADDRESS`, applicable `SELLER_GSTIN`, support/grievance contact, legal review date, and actual Contabo data-centre region.
+- Razorpay and notification values when those integrations are ready; do not invent credentials.
+
+The domain, hostnames, database name, and media path are prefilled for `firaao.shop`. Keep `DEBUG=0`, `POSTGRES_HOST=127.0.0.1`, and `SECURE_SSL_REDIRECT=1`. Quote values containing spaces (the legal/business defaults are already quoted). Do not add a `REDIS_URL` unless you have separately installed and secured Redis.
+
+Install the Python dependencies and verify Django settings:
+
+```bash
+cd /srv/firaao/looprewards
+python3 -m venv venv
+./venv/bin/pip install --upgrade pip
+./venv/bin/pip install -r requirements.txt
+mkdir -p media private-media backups
+chmod 755 /srv/firaao/looprewards
+sudo install -d -m 2750 -o firaao -g www-data /srv/firaao/looprewards/media
+sudo install -d -m 2750 -o firaao -g www-data /srv/firaao/looprewards/private-media
+sudo chown deploy:firaao .env
+chmod 640 .env
+set -a
+. ./.env
+set +a
+./venv/bin/python manage.py check
+./venv/bin/python manage.py migrate --noinput
+./venv/bin/python manage.py collectstatic --noinput
+```
+
+The committed migrations must be present in Git; do not create migrations on the production server.
+
+## 5. Install the systemd app and daily-job services
+
+Run these commands from the repository directory:
+
+```bash
+sudo install -m 644 deploy/firaao.service /etc/systemd/system/firaao.service
+sudo install -m 644 deploy/firaao-daily.service /etc/systemd/system/firaao-daily.service
+sudo install -m 644 deploy/firaao-daily.timer /etc/systemd/system/firaao-daily.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now firaao
+sudo systemctl enable --now firaao-daily.timer
+sudo systemctl status firaao --no-pager
+curl -fsS http://127.0.0.1:18080/healthz
+```
+
+Daily reminders, payouts, and retention checks run at about 02:15 India time. `AUTO_PURGE=0` is the safe default: expired-shop deletion is only reported, not applied.
+
+## 6. Route the domain through Nginx and enable HTTPS
+
+**Only do this if Nginx is the VPS's existing host proxy or ports 80/443 are free.** It does not replace existing sites. Install Firaao's separate site file:
+
+```bash
+cd /srv/firaao/looprewards
+sudo install -m 644 deploy/nginx-firaao.conf /etc/nginx/sites-available/firaao
+sudo ln -s /etc/nginx/sites-available/firaao /etc/nginx/sites-enabled/firaao
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Confirm DNS is pointing to this server and the HTTP site responds, then request the certificate:
+
+```bash
+getent ahostsv4 firaao.shop
+curl -I http://firaao.shop/healthz
+sudo certbot --nginx -d firaao.shop -d www.firaao.shop --redirect
+sudo certbot renew --dry-run
+```
+
+The Nginx site serves uploaded media from `/srv/firaao/looprewards/media/` and proxies app requests to localhost. Do not publish the app port or PostgreSQL to the internet.
+
+## 7. Create the administrator and run launch checks
+
+```bash
+cd /srv/firaao/looprewards
+set -a
+. ./.env
+set +a
+./venv/bin/python manage.py createsuperuser
+./venv/bin/python manage.py check --deploy
+curl -fsS https://firaao.shop/healthz
+```
+
+Open `https://firaao.shop/app/` and `https://firaao.shop/admin/`. Resolve all production-check warnings that apply; security headers such as HSTS are configured in Django. Use a staging domain and Razorpay test credentials before taking real payments.
+
+Before public launch, test the full owner/shop/customer/purchase/reward flows, mobile behavior, profile and bill-photo uploads, password reset, deletion, payment webhooks, and backups/restores. Review `/privacy/`, `/terms/`, `/refund/`, `/pricing/`, and `/contact/`; have a lawyer review legal terms and a CA review invoices/tax treatment.
+
+## 8. Push code updates and upgrade Firaao
+
+On your development computer, run tests and commit the reviewed code/migrations, then push to the Git branch used for deployment (default `main`):
+
+```bash
+python manage.py test
+git status --short
+git add <reviewed-files-and-migrations>
+git commit -m "Describe the update"
+git push origin main
+```
+
+On the VPS, each upgrade is one command:
+
+```bash
+ssh deploy@YOUR_CONTABO_VPS_IP
+cd /srv/firaao/looprewards
+bash ./deploy/deploy.sh
+```
+
+The script refuses a dirty checkout, takes a PostgreSQL+media backup first, fast-forwards from `origin/main`, installs updated Python requirements, checks settings, applies migrations, collects static files, restarts Firaao, and checks `/healthz`. If an upgrade fails, it restores the prior code and restarts the previous app version; it does not reverse database migrations. Use additive, backward-compatible migrations.
+
+Manual code rollback to the last successfully deployed revision:
+
+```bash
+cd /srv/firaao/looprewards
+bash ./deploy/rollback.sh
+```
+
+## 9. Backups and recovery
+
+Create a backup now and then schedule one every day:
+
+```bash
+cd /srv/firaao/looprewards
+bash ./deploy/backup.sh
+crontab -e
+```
+
+Add this cron line:
+
+```cron
+15 3 * * * /usr/bin/bash /srv/firaao/looprewards/deploy/backup.sh >> /srv/firaao/looprewards/backups/backup.log 2>&1
+```
+
+Backups include the database, uploaded media, and private UPI payment screenshots; local copies older than 14 days are removed. A server failure can destroy local backups, so configure an encrypted, access-restricted `rclone` remote and `RCLONE_REMOTE` in `.env` for offsite copies. Protect backups as customer data and practice restores on a separate test server.
+
+**Restore is destructive.** Verify the dump path, stop other work, and run:
+
+```bash
+cd /srv/firaao/looprewards
+bash ./deploy/restore.sh backups/db-DATE.dump backups/media-DATE.tgz backups/proofs-DATE.tgz
+```
+
+The script requires typing `RESTORE`, stops Firaao, replaces the selected database contents, restores the media and private screenshot archives, and starts the app. It does not stop or change other VPS projects. Do not use it as a routine rollback.
+
+## 10. Useful operations
+
+```bash
+sudo systemctl status firaao --no-pager
+sudo journalctl -u firaao -n 100 --no-pager
+sudo journalctl -u firaao -f
+sudo systemctl restart firaao
+sudo systemctl status firaao-daily.timer --no-pager
+sudo journalctl -u firaao-daily.service -n 100 --no-pager
+sudo nginx -t
+df -h
+free -h
+```
+
+If you change `.env`, restart Firaao with `sudo systemctl restart firaao`. Keep the database password and `SECRET_KEY` backed up securely; never commit `.env`. Monitor available disk, RAM, backups, TLS renewal, and the health endpoint.
+
+## 11. Payments, notifications, and capacity
+
+- Razorpay: configure the webhook at `https://firaao.shop/api/billing/webhook/` for the supported payment and subscription events; use test mode first. Keep API and webhook secrets in `.env`.
+- Manual UPI: set `PLATFORM_UPI_ID`; reconcile each payment in the bank statement before approving it in `/admin`.
+- SMS/WhatsApp: `NOTIFY_WEBHOOK_URL` must be your provider bridge; set `NOTIFY_SMS=1` only after verifying it.
+- Initial worker count is conservative (`WEB_WORKERS=2`). Check Contabo RAM/CPU and existing services before increasing it. Firaao does not require Redis for a basic single-server install; without Redis, per-process throttling/cache is not shared across workers.
+- Keep Contabo snapshots and offsite backups. Test the actual restore process before relying on it.
+
+## 12. Troubleshooting
+
+| Problem | Check |
+|---|---|
+| `502 Bad Gateway` | `sudo systemctl status firaao`; `sudo journalctl -u firaao -n 100 --no-pager`; local `/healthz` |
+| HTTP 400 / invalid host | `ALLOWED_HOSTS`, DNS, and Nginx `server_name` |
+| CSRF failure | `CSRF_TRUSTED_ORIGINS` includes both `https://firaao.shop` and `https://www.firaao.shop`; Nginx forwards `X-Forwarded-Proto` |
+| No TLS certificate | DNS A/AAAA records and Contabo firewall access to ports 80/443; `sudo certbot certificates` |
+| Database connection error | `sudo systemctl status postgresql`; verify `POSTGRES_*` in `.env` and that the role/database were created |
+| Upload failure | Check `MEDIA_ROOT`, directory ownership/permissions, free disk, and Nginx `client_max_body_size` |
+| Upgrade failed | Read `journalctl -u firaao`; deployment script restores old code but migrations are not reversed |
+
+## 13. Project operations and lifecycle
+
+- Customer/owner/staff/agent features and subscription behavior are documented in the app, legal pages, and `README.md`.
+- The daily retention command is deliberately a dry run unless `AUTO_PURGE=1`. Review its output and ensure offsite backups and legal retention policy are correct before enabling destructive purges.
+- Model changes require a reviewed migration generated during development, committed to Git, and applied by the upgrade script.
+- Never edit production code directly on the VPS; develop, test, commit, push, then run the upgrade command.

@@ -1,11 +1,40 @@
 #!/usr/bin/env bash
-# Restore the database from a dump:  ./deploy/restore.sh backups/db-2026-12-01-0315.dump
-set -euo pipefail
+set -Eeuo pipefail
 cd "$(dirname "$0")/.."
-[ -f "${1:-}" ] || { echo "Usage: $0 backups/db-....dump"; exit 1; }
-get() { grep -E "^$1=" .env | head -1 | cut -d= -f2-; }
-read -r -p "This REPLACES the current database. Type YES to continue: " a; [ "$a" = YES ] || exit 1
-docker compose stop web cron
-docker compose exec -T db pg_restore -U "$(get POSTGRES_USER)" -d "$(get POSTGRES_DB)" --clean --if-exists --no-owner < "$1"
-docker compose start web cron
-echo "Restored. Uploaded files: tar xzf backups/media-....tgz into the media volume if needed (see GUIDE.md)."
+
+DUMP="${1:-}"
+[[ -f "$DUMP" ]] || { echo "Usage: $0 backups/db-DATE.dump [backups/media-DATE.tgz]" >&2; exit 2; }
+MEDIA_ARCHIVE="${2:-}"
+PROOF_ARCHIVE="${3:-}"
+if [[ -n "$MEDIA_ARCHIVE" && ! -f "$MEDIA_ARCHIVE" ]]; then
+  echo "Media archive not found: $MEDIA_ARCHIVE" >&2
+  exit 2
+fi
+if [[ -n "$PROOF_ARCHIVE" && ! -f "$PROOF_ARCHIVE" ]]; then
+  echo "Proof archive not found: $PROOF_ARCHIVE" >&2
+  exit 2
+fi
+
+set -a
+. ./.env
+set +a
+
+read -r -p "This replaces the live Firaao database. Type RESTORE to continue: " answer
+[[ "$answer" == RESTORE ]] || exit 1
+
+sudo systemctl stop firaao
+export PGPASSWORD="$POSTGRES_PASSWORD"
+pg_restore -h "${POSTGRES_HOST:-127.0.0.1}" -p "${POSTGRES_PORT:-5432}" \
+  -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner --role="$POSTGRES_USER" < "$DUMP"
+unset PGPASSWORD
+if [[ -n "$MEDIA_ARCHIVE" ]]; then
+  sudo mkdir -p "${MEDIA_ROOT:-$PWD/media}"
+  sudo tar -xzf "$MEDIA_ARCHIVE" -C "${MEDIA_ROOT:-$PWD/media}"
+fi
+if [[ -n "$PROOF_ARCHIVE" ]]; then
+  sudo install -d -m 2750 -o firaao -g www-data "$PWD/private-media"
+  sudo tar -xzf "$PROOF_ARCHIVE" -C "$PWD/private-media"
+  sudo chown -R firaao:www-data "$PWD/private-media"
+fi
+sudo systemctl start firaao
+echo "Restore completed. Review logs and test the site before reopening traffic."

@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.shortcuts import render
 
-PAGES = {"privacy", "terms", "refund", "pricing", "contact"}
+PAGES = {"about", "privacy", "terms", "refund", "pricing", "contact", "shipping-delivery"}
 
 
 def page(request, page):

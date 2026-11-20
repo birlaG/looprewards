@@ -29,6 +29,11 @@ def _owner_only(user):
         raise PermissionDenied("Owner account required.")
 
 
+def _customer_only(user):
+    if user.role != "customer":
+        raise PermissionDenied("Customer account required.")
+
+
 @api_view(["POST"])
 @permission_classes([AllowAny])
 @throttle_classes([AuthThrottle])
@@ -42,7 +47,11 @@ def register(request):
     role = d.get("role") if d.get("role") in ("owner", "vendor") else "customer"
     if str(d.get("accepted")).lower() not in ("true", "1", "on"):
         raise ValidationError("Please accept the Terms and Privacy Policy.")
-    ref = Vendor.objects.filter(code=str(d.get("ref", "")).upper(), status="approved").first() if role == "owner" else None
+    ref = Vendor.objects.filter(
+        code=str(d.get("ref", "")).upper(),
+        status="approved",
+        user__is_active=True,
+    ).first() if role == "owner" else None
     u = User.objects.create_user(username=mobile, password=pw, first_name=d.get("name", ""), role=role, referred_by=ref, consent_at=timezone.now())
     return Response({"token": Token.objects.create(user=u).key, "role": role}, status=201)
 
@@ -99,6 +108,12 @@ def public_business(request, code):
     data["programs"] = ProgramSerializer(active_programs, many=True).data
     if biz.pay_upi_id:
         data["pay_link"] = "upi://pay?" + urlencode({"pa": biz.pay_upi_id, "pn": biz.name, "cu": "INR"})
+    from . import engage
+    from .serializers import ServiceSerializer
+    data["boosts_now"] = [engage.boost_dict(b) for b in engage.active_boosts(biz)]
+    data["services"] = ServiceSerializer(biz.services.filter(active=True), many=True).data if biz.bookings_enabled else []
+    data["perks"] = {r.trigger: {"title": r.title} for r in biz.perk_rewards.filter(trigger__in=("welcome", "referral"))}
+    data["tiers"] = [{"tier": t, "visits": n, "perk": perk} for t, n, perk in engage.tier_ladder(biz)[1:]]
     return Response(data)
 
 
@@ -108,7 +123,10 @@ def business_qr(request, code):
     biz = get_object_or_404(Business, shop_code=code)
     buf = io.BytesIO()
     segno.make(f"{settings.BASE_URL}/b/{biz.shop_code}", error="m").save(buf, kind="png", scale=10, border=4)
-    return HttpResponse(buf.getvalue(), content_type="image/png")
+    response = HttpResponse(buf.getvalue(), content_type="image/png")
+    if request.GET.get("download") == "1":
+        response["Content-Disposition"] = f'attachment; filename="{biz.shop_code}-shop-qr.png"'
+    return response
 
 
 @api_view(["POST"])
@@ -116,7 +134,17 @@ def join(request, code):
     biz = get_object_or_404(Business, shop_code=code)
     if not biz.is_live:
         raise ValidationError("This shop is paused.")
-    p, _ = CustomerProfile.objects.get_or_create(user=request.user, business=biz)
+    p, created = CustomerProfile.objects.get_or_create(user=request.user, business=biz)
+    ref = str(request.data.get("ref", "")).strip().upper()
+    if created and ref:  # invited by another customer of this shop
+        friend = CustomerProfile.objects.filter(business=biz, referral_code=ref, status="active").exclude(
+            user=request.user).first()
+        if friend:
+            p.referred_by = friend
+            p.save(update_fields=["referred_by"])
+    if p.hidden_from_customer:
+        p.hidden_from_customer = False
+        p.save(update_fields=["hidden_from_customer"])
     if "consent" in request.data:
         p.marketing_consent = bool(request.data["consent"])
         p.save()
@@ -136,15 +164,19 @@ def submit_entry(request):
 def pending(request):
     _mgr_only(request.user)
     qs = PurchaseEntry.objects.filter(status="pending").filter(
-        Q(profile__business__owner=request.user) | Q(profile__business__staff__user=request.user))
+        Q(profile__business__owner=request.user) | Q(profile__business__staff__user=request.user)
+    ).select_related("profile__user", "profile__business", "task")
     return Response(EntrySerializer(qs.order_by("created_at"), many=True).data)
 
 
 @api_view(["POST"])
 def review(request, pk):
     _mgr_only(request.user)
+    action = request.data.get("action")
+    if action not in ("approve", "reject"):
+        raise ValidationError("Choose approve or reject.")
     entry = get_object_or_404(PurchaseEntry, pk=pk)  # services.review_entry enforces owner/staff of that shop
-    e = services.review_entry(entry, request.user, approve=request.data.get("action") == "approve")
+    e = services.review_entry(entry, request.user, approve=action == "approve")
     return Response(EntrySerializer(e).data)
 
 
@@ -158,15 +190,66 @@ def redeem(request):
 @api_view(["GET"])
 def my_shops(request):
     out = []
-    for p in request.user.profiles.select_related("business"):
+    for p in request.user.profiles.filter(hidden_from_customer=False).select_related("business"):
+        entries = p.entries.select_related("task").order_by("-created_at", "-id")
+        if p.history_hidden_before:
+            entries = entries.filter(created_at__gte=p.history_hidden_before)
         out.append({
             "shop": p.business.name, "shop_code": p.business.shop_code, "consent": p.marketing_consent,
-            "progress": [{"task_id": t.task_id, "task": t.task.title, "current": t.current_value, "target": t.target or t.task.target,
+            "history_hidden_before": p.history_hidden_before,
+            "progress": [{"task_id": t.task_id, "task": t.task.title, "task_type": t.task.type,
+                          "current": t.current_value, "target": t.target or t.task.target,
                           "completed": t.completed_count} for t in p.progress.select_related("task")],
-            "rewards": [{"title": g.reward.title, "code": g.code, "status": g.status,
+            "rewards": [{"title": g.reward.title, "type": g.reward.type, "value": g.reward.value,
+                         "terms": g.reward.terms, "code": g.code, "status": g.status,
                          "expires_at": g.expires_at} for g in p.grants.select_related("reward")],
+            "entries": [{"id": e.id, "task_id": e.task_id, "task_title": e.task.title,
+                         "task_type": e.task.type, "value": e.value, "status": e.status,
+                         "created_at": e.created_at, "reviewed_at": e.reviewed_at}
+                        for e in entries[:10]],
         })
     return Response(out)
+
+
+@api_view(["GET"])
+def hidden_shops(request):
+    _customer_only(request.user)
+    return Response(list(request.user.profiles.filter(hidden_from_customer=True).select_related(
+        "business"
+    ).values("business__name", "business__shop_code")))
+
+
+@api_view(["DELETE"])
+def hide_shop(request, code):
+    _customer_only(request.user)
+    profile = get_object_or_404(CustomerProfile, user=request.user, business__shop_code=code)
+    if not profile.hidden_from_customer:
+        profile.hidden_from_customer = True
+        profile.save(update_fields=["hidden_from_customer"])
+    return Response(status=204)
+
+
+@api_view(["POST"])
+def restore_shop(request, code):
+    _customer_only(request.user)
+    profile = get_object_or_404(CustomerProfile, user=request.user, business__shop_code=code)
+    if profile.hidden_from_customer:
+        profile.hidden_from_customer = False
+        profile.save(update_fields=["hidden_from_customer"])
+    return Response({"shop_code": code, "hidden": False})
+
+
+@api_view(["DELETE", "POST"])
+def customer_history(request, code):
+    _customer_only(request.user)
+    profile = get_object_or_404(CustomerProfile, user=request.user, business__shop_code=code)
+    if request.method == "DELETE":
+        profile.history_hidden_before = timezone.now()
+        profile.save(update_fields=["history_hidden_before"])
+    else:
+        profile.history_hidden_before = None
+        profile.save(update_fields=["history_hidden_before"])
+    return Response({"history_hidden_before": profile.history_hidden_before})
 
 
 from django.contrib.auth import authenticate
@@ -180,6 +263,18 @@ def login(request):
     if not u:
         raise ValidationError("Wrong mobile or password.")
     return Response({"token": Token.objects.get_or_create(user=u)[0].key, "role": u.role, "needs_consent": u.consent_at is None})
+
+
+@api_view(["GET", "PATCH"])
+def profile(request):
+    user = request.user
+    if request.method == "PATCH":
+        name = request.data.get("name")
+        if not isinstance(name, str) or len(name.strip()) > 150:
+            raise ValidationError("Enter a name up to 150 characters.")
+        user.first_name = name.strip()
+        user.save(update_fields=["first_name"])
+    return Response({"name": user.first_name, "mobile": user.username, "role": user.role})
 
 
 @api_view(["GET"])
@@ -198,9 +293,11 @@ from . import counter
 from .models import StaffMember, can_manage
 
 
-@api_view(["POST", "DELETE"])
+@api_view(["GET", "POST", "DELETE"])
 def staff(request, code):
     biz = get_object_or_404(Business, shop_code=code, owner=request.user)
+    if request.method == "GET":
+        return Response([{"mobile": m.user.username, "name": m.user.first_name} for m in biz.staff.select_related("user")])
     d, mobile = request.data, str(request.data.get("mobile", "")).strip()
     if request.method == "DELETE":
         User.objects.filter(username=mobile, staff_of__business=biz).delete()

@@ -1,6 +1,7 @@
 import hashlib, secrets
 from datetime import timedelta
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -11,10 +12,10 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from . import services
-from .models import (AuditLog, Business, CustomerProfile, OtpCode, Payment, Program, PurchaseEntry, Subscription,
-                     Task, User, Vendor)
+from .models import (AuditLog, Business, CustomerProfile, OtpCode, Payment, Program, PurchaseEntry, RewardGrant,
+                     Subscription, Task, TaskProgress, User, Vendor)
 from .notify import notify, push
-from .serializers import BusinessSerializer, EntrySerializer
+from .serializers import BusinessSerializer, CustomerProfileImageSerializer, EntrySerializer
 
 
 @api_view(["PATCH"])
@@ -29,9 +30,37 @@ def business_settings(request, code):
     return Response(s.data)
 
 
-@api_view(["PATCH"])
+@api_view(["PATCH", "DELETE"])
+@transaction.atomic
 def program_update(request, pk):  # pause / resume / end / rename
-    pr = get_object_or_404(Program, pk=pk, business__owner=request.user)
+    pr = get_object_or_404(Program.objects.select_for_update(), pk=pk, business__owner=request.user)
+    archived = AuditLog.objects.filter(
+        business=pr.business, action="program_archived", ref=str(pr.pk)
+    ).exists()
+    if request.method == "DELETE":
+        if archived:
+            return Response({"archived": True, "detail": "This program is already archived."})
+        task_ids = pr.tasks.values_list("id", flat=True)
+        has_customer_data = (
+            PurchaseEntry.objects.filter(task_id__in=task_ids).exists()
+            or TaskProgress.objects.filter(task_id__in=task_ids).exists()
+            or RewardGrant.objects.filter(reward__task_id__in=task_ids).exists()
+        )
+        if has_customer_data:
+            pr.active = False
+            pr.end = timezone.localdate() - timedelta(days=1)
+            pr.save(update_fields=["active", "end"])
+            AuditLog.objects.create(
+                business=pr.business, actor=request.user, action="program_archived", ref=str(pr.pk)
+            )
+            return Response({
+                "archived": True,
+                "detail": "This program has customer history, so it was archived. Existing progress and reward codes are preserved.",
+            })
+        pr.delete()
+        return Response({"archived": False, "detail": "Program deleted."})
+    if archived and request.data.get("active") is True:
+        raise ValidationError("Archived programs cannot be resumed. Create a new program instead.")
     for k in ("title", "active", "start", "end"):
         if k in request.data:
             setattr(pr, k, request.data[k])
@@ -102,7 +131,33 @@ def delete_me(request):
         u.set_unusable_password()
         u.save()
         u.businesses.update(status="closed")
+        if hasattr(u, "vendor"):
+            u.vendor.status = "suspended"
+            u.vendor.save(update_fields=["status"])
     return Response(status=204)
+
+
+@api_view(["GET", "PATCH", "DELETE"])
+def profile_image(request):
+    if request.user.role != "customer":
+        raise PermissionDenied("Customer account required.")
+    user = request.user
+    if request.method == "GET":
+        return Response({"profile_image_url": user.profile_image.url if user.profile_image else ""})
+    if request.method == "DELETE":
+        if user.profile_image:
+            user.profile_image.delete(save=False)
+            user.profile_image = ""
+            user.save(update_fields=["profile_image"])
+        return Response({"profile_image_url": ""})
+    serializer = CustomerProfileImageSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    previous_name = user.profile_image.name
+    user.profile_image = serializer.validated_data["profile_image"]
+    user.save(update_fields=["profile_image"])
+    if previous_name and previous_name != user.profile_image.name:
+        user.profile_image.storage.delete(previous_name)
+    return Response({"profile_image_url": user.profile_image.url})
 
 
 def _h(code):
@@ -117,7 +172,7 @@ def otp_request(request):
     if u and not OtpCode.objects.filter(user=u, created_at__gte=timezone.now() - timedelta(seconds=60)).exists():
         code = f"{secrets.randbelow(10**6):06d}"
         OtpCode.objects.create(user=u, code_hash=_h(code), expires=timezone.now() + timedelta(minutes=10))
-        notify(u, f"LoopRewards OTP {code}. Valid for 10 minutes. Do not share it.")
+        notify(u, f"Firaao OTP {code}. Valid for 10 minutes. Do not share it.")
     return Response({"detail": "If the number is registered, an OTP was sent."})  # same answer either way
 
 

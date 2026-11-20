@@ -1,7 +1,12 @@
 from django.contrib import admin
+from django.http import FileResponse
+from django.urls import path, reverse
+from django.utils.html import format_html
+import mimetypes
 from . import models
 from .billing import mark_paid
 from .vendors import reverse
+from .notify import push
 for m in (models.User, models.Business, models.Program, models.Task, models.Reward,
           models.CustomerProfile, models.PurchaseEntry, models.RewardGrant, models.AuditLog):
     admin.site.register(m)
@@ -9,13 +14,42 @@ for m in (models.User, models.Business, models.Program, models.Task, models.Rewa
 
 @admin.register(models.Payment)
 class PaymentAdmin(admin.ModelAdmin):
-    list_display = ("id", "owner", "plan", "amount", "method", "status", "utr", "created_at")
+    list_display = ("id", "owner", "plan", "amount", "method", "status", "utr", "proof_link", "created_at")
     list_filter = ("status", "method")
     actions = ["approve", "reject", "refund"]
+    exclude = ("proof",)
+    readonly_fields = ("proof_preview",)
 
-    @admin.action(description="Approve selected UPI payments (verify UTR in bank first)")
+    def get_urls(self):
+        return [path("<int:payment_id>/proof/", self.admin_site.admin_view(self.payment_proof),
+                     name="core_payment_proof")] + super().get_urls()
+
+    def payment_proof(self, request, payment_id):
+        payment = self.get_object(request, str(payment_id))
+        if not payment or payment.method != "upi" or not payment.proof:
+            from django.http import Http404
+            raise Http404
+        response = FileResponse(payment.proof.open("rb"),
+            content_type=mimetypes.guess_type(payment.proof.name)[0] or "application/octet-stream")
+        response["Content-Disposition"] = "inline"
+        response["Cache-Control"] = "private, no-store"
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
+
+    @admin.display(description="Payment screenshot")
+    def proof_link(self, payment):
+        if not payment.proof:
+            return "—"
+        url = reverse("admin:core_payment_proof", args=[payment.pk])
+        return format_html('<a href="{}" target="_blank" rel="noopener">View screenshot</a>', url)
+
+    @admin.display(description="Payment screenshot")
+    def proof_preview(self, payment):
+        return self.proof_link(payment)
+
+    @admin.action(description="Approve selected UPI payments (review screenshot and verify bank UTR first)")
     def approve(self, request, qs):
-        for p in qs.filter(method="upi").exclude(status="paid"):
+        for p in qs.filter(method="upi", status="pending"):
             mark_paid(p.pk)
 
     @admin.action(description="Reject selected")
@@ -30,13 +64,20 @@ class PaymentAdmin(admin.ModelAdmin):
 
 @admin.register(models.Vendor)
 class VendorAdmin(admin.ModelAdmin):
-    list_display = ("code", "user", "rate", "upi_id", "pan", "status")
+    list_display = ("code", "user", "status", "rate", "applied_at", "upi_id")
+    list_filter = ("status",)
+    search_fields = ("code", "user__username", "user__first_name")
+    readonly_fields = ("code", "applied_at")
     actions = ["approve", "suspend"]
 
-    @admin.action(description="Approve vendors")
-    def approve(self, request, qs): qs.update(status="approved")
+    @admin.action(description="Approve selected applications (activates referral links and earning)")
+    def approve(self, request, qs):
+        vendors = list(qs.filter(status__in=("pending", "suspended")).select_related("user"))
+        qs.filter(pk__in=[vendor.pk for vendor in vendors]).update(status="approved")
+        for vendor in vendors:
+            push(vendor.user, "Your vendor profile is approved. Your referral link is now active in your dashboard.")
 
-    @admin.action(description="Suspend vendors")
+    @admin.action(description="Suspend selected vendors (pause referral attribution and access)")
     def suspend(self, request, qs): qs.update(status="suspended")
 
 
@@ -48,14 +89,16 @@ class CommissionAdmin(admin.ModelAdmin):
 
 @admin.register(models.Payout)
 class PayoutAdmin(admin.ModelAdmin):
-    list_display = ("id", "vendor", "amount", "status", "reference", "created_at")
+    list_display = ("id", "vendor", "amount", "tds", "status", "reference", "paid_at", "created_at")
+    list_filter = ("status",)
+    readonly_fields = ("tds", "paid_at")
     actions = ["paid"]
 
-    @admin.action(description="Mark paid (after you transfer to vendor UPI/bank, less TDS if applicable)")
+    @admin.action(description="Mark paid (withholds TDS automatically if VENDOR_TDS_RATE is set; transfer the net amount to the vendor)")
     def paid(self, request, qs):
+        from .vendors import mark_payout_paid
         for po in qs.filter(status="pending"):
-            po.status = "paid"; po.save()
-            po.commission_set.update(status="paid")
+            mark_payout_paid(po)
 
 
 @admin.register(models.Subscription)

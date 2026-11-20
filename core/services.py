@@ -1,12 +1,13 @@
 """Business rules: submit / review purchases, progress, reward grants, redemption."""
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied, ValidationError
-from . import counter
+from django.db.models import Q
+from . import counter, engage
 from .notify import push
-from .models import AuditLog, CodeUse, PurchaseEntry, RewardGrant, TaskProgress, can_manage
+from .models import (AuditLog, Booking, CodeUse, PurchaseEntry, RewardGrant, Task, TaskProgress, can_manage)
 
 
 def _log(business, actor, action, ref=""):
@@ -27,9 +28,19 @@ def submit_entry(profile, task, value, bill_photo=None, counter_code="", lat=Non
         raise ValidationError(f"Please wait {biz.cooldown_minutes} minutes between entries.")
     if mine.filter(created_at__date=timezone.localdate()).count() >= biz.daily_cap:
         raise ValidationError("Daily entry limit reached.")
-    value = Decimal("1") if task.type == "visit" else Decimal(str(value))
-    if value <= 0:
-        raise ValidationError("Invalid quantity/amount.")
+    if task.type == "visit":
+        value = Decimal("1")
+    else:
+        try:
+            value = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            raise ValidationError("Enter a valid quantity or amount.")
+        if not value.is_finite() or value <= 0 or value > Decimal("99999999.99"):
+            raise ValidationError("Quantity or amount is outside the allowed range.")
+        if value.quantize(Decimal("0.01")) != value:
+            raise ValidationError("Amounts can have at most two decimal places.")
+        if task.type == "count" and value != value.to_integral_value():
+            raise ValidationError("Quantity must be a whole number.")
     far, dist = False, None
     if None not in (lat, lng, biz.lat, biz.lng):
         dist = int(_dist_m(lat, lng, biz.lat, biz.lng))
@@ -74,6 +85,7 @@ def review_entry(entry, actor, approve):
     push(entry.profile.user, f"{biz.name}: your purchase was {entry.status}.")
     if approve:
         _apply_progress(entry)
+        engage.after_approval(entry.profile)
     return entry
 
 
@@ -82,7 +94,11 @@ def _apply_progress(entry):
     prog, _ = TaskProgress.objects.select_for_update().get_or_create(profile=profile, task=task)
     if prog.target is None:
         prog.target = task.target  # snapshot: later edits do not change this customer's goal
-    prog.current_value += entry.value
+    mult = engage.multiplier_for(profile.business, entry.created_at, task)
+    credit = entry.value * mult
+    entry.multiplier, entry.credited_value = mult, credit  # remembered so Undo reverses exactly what was credited
+    entry.save(update_fields=["multiplier", "credited_value"])
+    prog.current_value += credit
     if task.repeatable:
         cap = task.max_per_customer or None  # 0 = unlimited
     else:
@@ -134,10 +150,20 @@ def reverse_entry(entry, actor):
         raise PermissionDenied()
     if entry.status != "approved":
         raise ValidationError("Only approved entries can be undone.")
+    if not entry.reviewed_at or timezone.now() > entry.reviewed_at + timedelta(seconds=5):
+        raise ValidationError("The 5-second undo window has expired.")
+    if PurchaseEntry.objects.filter(
+        profile=entry.profile, task=entry.task, status="approved", reviewed_at__gt=entry.reviewed_at,
+    ).exists():
+        raise ValidationError("A newer purchase has already been approved for this task.")
+    if RewardGrant.objects.select_for_update().filter(
+        profile=entry.profile, reward__task=entry.task, status="used", issued_at__gte=entry.reviewed_at,
+    ).exists():
+        raise ValidationError("This purchase cannot be undone because its reward was already redeemed.")
     task = entry.task
     prog = TaskProgress.objects.select_for_update().get(profile=entry.profile, task=task)
     tgt = prog.target or task.target
-    prog.current_value -= entry.value
+    prog.current_value -= entry.credited_value if entry.credited_value is not None else entry.value
     while prog.current_value < 0 and prog.completed_count > 0:
         prog.completed_count -= 1
         prog.current_value += tgt
@@ -148,4 +174,45 @@ def reverse_entry(entry, actor):
     prog.save()
     entry.status = "reversed"; entry.save()
     _log(biz, actor, "reversed", entry.id)
+    push(entry.profile.user, f"{biz.name}: your purchase approval was undone.")
     return entry
+
+
+@transaction.atomic
+def complete_booking(booking, actor):
+    """Staff marks an appointment as done. The visit is credited to every live program (visit tasks +1, amount
+    tasks += service price, count tasks +1 when they are not tied to a different item), exactly once."""
+    booking = Booking.objects.select_for_update().select_related("profile__business", "profile__user", "service").get(pk=booking.pk)
+    biz = booking.profile.business
+    if not can_manage(actor, biz):
+        raise PermissionDenied()
+    if booking.status not in ("requested", "confirmed"):
+        raise ValidationError("This booking is already closed.")
+    booking.status = "completed"
+    credited = []
+    if not booking.credited and booking.profile.status == "active" and biz.is_live:
+        today = timezone.localdate()
+        tasks = Task.objects.filter(program__business=biz, program__active=True).filter(
+            Q(program__start__isnull=True) | Q(program__start__lte=today)).filter(
+            Q(program__end__isnull=True) | Q(program__end__gte=today))
+        for t in tasks:
+            if t.type == "amount":
+                v = booking.service.price
+            elif t.type == "visit" or not t.item_name or t.item_name.strip().lower() == booking.service.name.strip().lower():
+                v = Decimal("1")
+            else:
+                continue
+            if v <= 0:
+                continue
+            e = PurchaseEntry.objects.create(profile=booking.profile, task=t, value=v, status="approved",
+                                             reviewed_by=actor, reviewed_at=timezone.now())
+            _apply_progress(e)
+            credited.append(e.id)
+        if credited:
+            engage.after_approval(booking.profile)
+        booking.credited = True
+    booking.save()
+    _log(biz, actor, "booking_completed", booking.id)
+    push(booking.profile.user, f"{biz.name}: thanks for visiting! Your {booking.service.name} visit is recorded."
+         + (" Check your progress." if credited else ""))
+    return booking

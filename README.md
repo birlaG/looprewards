@@ -1,33 +1,43 @@
-# LoopRewards
+> **v2:** see [UPGRADE.md](UPGRADE.md) for the new growth layer, frontend and upgrade steps.
+
+# Firaao
 
 ## Deploy
-See **GUIDE.md** (Contabo step-by-step, updating, backups, scaling). Quick: `make deploy` on the server.
+Firaao runs directly on Ubuntu without Docker. See **[GUIDE.md](GUIDE.md)** for step-by-step Contabo setup for `firaao.shop`, Nginx/HTTPS, backups, upgrades, and rollback. Once installed, upgrade with `bash ./deploy/deploy.sh`.
 
 ## Local development
-    DEBUG=1 pip install -r requirements.txt && DEBUG=1 python manage.py makemigrations core && DEBUG=1 python manage.py migrate
-    DEBUG=1 python manage.py test && DEBUG=1 python manage.py runserver
+    py -m venv .venv
+    .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+    $env:DEBUG = "1"
+    .\.venv\Scripts\python.exe manage.py makemigrations core
+    .\.venv\Scripts\python.exe manage.py test
+    .\.venv\Scripts\python.exe manage.py runserver
+
 
 ## Counter / desk card (profile + QR only, no bills)
 Owner dashboard has buttons for A6 counter card, A5, desk tent (A4 folded) and A4 B/W.
 Direct: /print/<shop_code>/?size=a6|a5|a4|tent[&bw=1] -> Print button.
 
-## Not built yet
-OTP/SMS, subscriptions/billing, staff accounts + rotating code, vendor/affiliate,
-GPS check, push/WhatsApp notifications, reports, multi-language UI.
+## Launch readiness
+Before production, follow **[GUIDE.md](GUIDE.md)**, complete the pilot checklist, and test payments,
+notifications, backups, and restore on a staging domain. External provider integrations require
+your own credentials and end-to-end verification; passing the local tests does not verify them.
 
 ## Billing
 - 14-day trial (no card), then ₹299/mo or ₹2,999/yr (edit `PLANS` in settings). 30-day grace: profile/QR paused, print kit + progress kept.
-- Online: Razorpay Checkout (UPI/cards/netbanking). Add webhook `https://<domain>/api/billing/webhook/`, events `payment.captured` + `order.paid`.
-- UPI QR/ID: owner pays platform UPI, enters UTR; admin approves in /admin -> Payments -> "Approve selected UPI payments" after checking the bank statement.
+- Online: Razorpay Checkout (UPI/cards/netbanking); payment is verified by signature and activated immediately. Add webhook `https://<domain>/api/billing/webhook/`, events `payment.captured` + `order.paid`.
+- Manual UPI: set `PLATFORM_UPI_ID`; owner pays the displayed amount and submits the UTR plus a JPEG/PNG/WebP screenshot (max 5 MB). An admin checks the bank statement and screenshot in /admin -> Payments, then approves the submission. Screenshots are stored privately and included in protected backups.
 
 ## Invoices and reminders
 - Each paid payment gets invoice no. `LR/<yy>/<id>` and a printable GST invoice (price treated as GST-inclusive; set SELLER_* in .env). Have your CA confirm the format (CGST/SGST vs IGST split by state is not done).
-- `python manage.py send_reminders` (run daily by the `cron` container): trial ends in 2 days, renewal in 7 days, paused notice. Point NOTIFY_WEBHOOK_URL at your SMS/WhatsApp bridge, else it only logs.
-- After the first run commit the generated `core/migrations/` folder so production uses fixed migrations.
+- `python manage.py send_reminders` (run daily by the `firaao-daily.timer` systemd timer): trial ends in 2 days, renewal in 7 days, paused notice. Point NOTIFY_WEBHOOK_URL at your SMS/WhatsApp bridge, else it only logs.
+- Database migrations are committed in `core/migrations/`; create and commit a reviewed migration whenever a model change requires one.
 
 ## Vendors / agents
-- Agent registers as "agent / reseller" in the app, applies with PAN + UPI ID; you approve in /admin -> Vendors and set the rate (default 20%).
-- Attribution is permanent: owner signs up via `/app/?ref=CODE` or the agent uses "Register a shop for an owner" (temp password; owner changes it).
+- **Account and approval:** create an account in the app and choose **agent / reseller**. Sign in, submit the partner application using your PAN and payout UPI ID, then wait for an administrator to review it under `/admin` -> **Vendors**. The dashboard shows **Application received — review in progress** while pending. Approval sends an in-app notification, activates referrals, and shows the partner dashboard; refreshing the page checks the latest status.
+- **No application / no earnings:** a vendor login without an application is not yet a partner account. Submit the application first. Pending or suspended vendors cannot refer owners or earn. New signups alone do not create commissions: an attributed owner must successfully pay for a subscription.
+- The approved vendor dashboard shows the referral link, referred owners/shops, commission activity, on-hold versus payout-processing totals, payout minimum, monthly schedule, and transfer history. Only new shop-owner registrations made while the vendor is approved are attributed; attribution is permanent after signup.
+- Vendors can also create an owner and shop from the dashboard. The returned one-time password is set on that account; share it securely and have the owner change it after signing in.
 - Commission = rate × subscription price excluding GST, created only on a real paid payment (never trial), 30-day hold, single level, every renewal (set `COMMISSION_FIRST_YEAR_ONLY=1` for year one only).
 - Refund: /admin -> Payments -> "Mark refunded" reverses a held commission.
 - Monthly (1st) `run_payouts` bundles ripe commissions ≥ ₹500 into Payouts; you transfer via UPI/bank (deduct TDS as required) and mark "paid" in /admin.
@@ -40,7 +50,9 @@ GPS check, push/WhatsApp notifications, reports, multi-language UI.
 
 ## Reports and notifications
 - Owner dashboard (per shop): customers, repeat-customer rate, top customers, rewards issued vs redeemed, peak hours, approved today, and a customers CSV (signed link valid 10 min). Customer name and mobile are visible only to the shop they joined.
-- In-app notifications: customer gets approved/rejected, reward unlocked, reward expiring (3 days, from the daily `send_reminders`); owner and staff get "new purchase pending". Set `NOTIFY_SMS=1` + `NOTIFY_WEBHOOK_URL` to also send reward unlocked/expiring by SMS/WhatsApp. Broadcast offers need customer marketing consent, so they are not built yet.
+- In-app notifications: customer gets approved/rejected, reward unlocked, reward expiring (3 days, from the daily `send_reminders`); owner and staff get "new purchase pending". Set `NOTIFY_SMS=1` + `NOTIFY_WEBHOOK_URL` to also send reward unlocked/expiring by SMS/WhatsApp. Broadcast offers are delivered in-app only to customers who opted in to marketing.
+- **Account center:** every signed-in role can update their display name and change their password from Account. Customers can also manage their profile photo; mobile numbers remain read-only.
+- Customers can hide past purchase history from their account or hide a shop from their profile; shop records, membership, progress, and rewards are preserved. Hidden shops can be restored from Account, and reopening a live shop QR restores it automatically.
 
 ## Hindi
 - The app has an English/हिन्दी button (top right), remembered per phone; it defaults to the shop's language (set when creating the shop) or the phone language. Owner/staff/customer/agent screens, common error messages and notifications are translated; the print card is Hindi when the shop language is Hindi (or `?lang=hi`).
@@ -48,7 +60,7 @@ GPS check, push/WhatsApp notifications, reports, multi-language UI.
 
 ## Safety, renewal and privacy features
 - **GPS check (soft):** the customer's phone sends its location with each entry; shops set their location once (Settings -> "Set shop location"). Beyond `max_distance_m` (default 300 m) the entry is flagged "far from shop", never auto-approved (even with a counter code), and the owner sees a warning.
-- **Bill photo:** optional per shop (Settings -> Require bill photo). Files get random names and are served from `/media/`; keep nginx as provided.
+- **Bill photo:** optional per shop (Settings -> Require bill photo). Files get random names and are served from `/media/`; Nginx serves the configured media directory as described in GUIDE.md.
 - **Undo + block:** "Recent approvals" has Undo (reverses progress and revokes an unredeemed reward); pending entries have "Block customer".
 - **Pause/resume** a program from the dashboard; `PATCH /api/tasks/<id>/` edits a task. Customers already in progress keep the target they started with (snapshot), new cycles use the new target.
 - **Auto-renew:** Razorpay Subscriptions (UPI AutoPay/cards). Create two plans in Razorpay, set `RAZORPAY_PLAN_MONTHLY/YEARLY`, and add `subscription.charged` to the webhook. The first charge is after the trial / current period; each charge creates a payment, invoice and commission automatically. Owners can cancel in the dashboard.

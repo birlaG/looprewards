@@ -1,6 +1,8 @@
 import secrets, string
 from django.contrib.auth.models import AbstractUser
 from django.db import models
+from django.utils import timezone
+from .private_storage import PrivateMediaStorage
 
 
 def new_shop_code():
@@ -16,9 +18,20 @@ def _bill_path(instance, filename):  # unguessable file names
     return f"bills/{uuid.uuid4().hex}{os.path.splitext(filename)[1][:6]}"
 
 
+def _profile_image_path(instance, filename):
+    import os, uuid
+    return f"profiles/{uuid.uuid4().hex}{os.path.splitext(filename)[1][:6]}"
+
+
+def _payment_proof_path(instance, filename):
+    import os, uuid
+    return f"payment-proofs/{uuid.uuid4().hex}{os.path.splitext(filename)[1].lower()}"
+
+
 class User(AbstractUser):  # username == mobile number
-    ROLES = [("owner", "owner"), ("staff", "staff"), ("customer", "customer")]
+    ROLES = [("owner", "owner"), ("staff", "staff"), ("customer", "customer"), ("vendor", "vendor")]
     role = models.CharField(max_length=10, choices=ROLES, default="customer")
+    profile_image = models.ImageField(upload_to=_profile_image_path, blank=True)
 
 
 class Business(models.Model):
@@ -38,6 +51,20 @@ class Business(models.Model):
     approval_mode = models.CharField(max_length=10, default="manual", choices=[("manual", "manual"), ("auto", "auto")])
     cooldown_minutes = models.PositiveIntegerField(default=10)
     daily_cap = models.PositiveIntegerField(default=3)
+    # --- v2: branding (public shop page) ---
+    brand_color = models.CharField(max_length=7, default="#126b5c", blank=True)
+    logo = models.ImageField(upload_to="logos/", blank=True)
+    about = models.TextField(blank=True, max_length=600)
+    phone = models.CharField(max_length=20, blank=True)
+    whatsapp = models.CharField(max_length=20, blank=True)
+    maps_url = models.URLField(blank=True)
+    # --- v2: membership tiers (lifetime approved visits) ---
+    tier_silver_visits = models.PositiveIntegerField(default=5)
+    tier_gold_visits = models.PositiveIntegerField(default=15)
+    silver_perk = models.CharField(max_length=120, blank=True)
+    gold_perk = models.CharField(max_length=120, blank=True)
+    # --- v2: appointments for service businesses ---
+    bookings_enabled = models.BooleanField(default=False)
 
     def __str__(self):
         return self.name
@@ -66,12 +93,16 @@ class Task(models.Model):
 class Reward(models.Model):
     TYPES = [("free_item", "free_item"), ("percent_off", "percent_off"), ("flat_off", "flat_off"),
              ("gift", "gift"), ("custom", "custom")]
-    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="rewards")
+    TRIGGERS = [("task", "task"), ("welcome", "welcome"), ("referral", "referral"), ("retired", "retired")]
+    task = models.ForeignKey(Task, null=True, blank=True, on_delete=models.CASCADE, related_name="rewards")
     title = models.CharField(max_length=120)
     type = models.CharField(max_length=12, choices=TYPES)
     value = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     expiry_days = models.PositiveIntegerField(default=30)
     terms = models.TextField(blank=True)
+    # v2: "welcome" (first approved purchase) and "referral" (friend's first purchase) rewards have no task
+    trigger = models.CharField(max_length=10, choices=TRIGGERS, default="task")
+    business = models.ForeignKey(Business, null=True, blank=True, on_delete=models.CASCADE, related_name="perk_rewards")
 
 
 class CustomerProfile(models.Model):  # one global login, separate profile per business
@@ -79,6 +110,11 @@ class CustomerProfile(models.Model):  # one global login, separate profile per b
     business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name="customers")
     status = models.CharField(max_length=10, default="active")  # active / blocked
     joined_at = models.DateTimeField(auto_now_add=True)
+    hidden_from_customer = models.BooleanField(default=False)
+    history_hidden_before = models.DateTimeField(null=True, blank=True)
+    referral_code = models.CharField(max_length=8, blank=True, db_index=True)  # generated lazily (see engage.ensure_ref_code)
+    referred_by = models.ForeignKey("self", null=True, blank=True, on_delete=models.SET_NULL, related_name="referred")
+    note = models.CharField(max_length=300, blank=True)  # private owner note, never shown to the customer
 
     class Meta:
         unique_together = ("user", "business")
@@ -88,11 +124,13 @@ class PurchaseEntry(models.Model):
     profile = models.ForeignKey(CustomerProfile, on_delete=models.CASCADE, related_name="entries")
     task = models.ForeignKey(Task, on_delete=models.CASCADE)
     value = models.DecimalField(max_digits=10, decimal_places=2, default=1)  # qty or amount
-    status = models.CharField(max_length=10, default="pending")  # pending/approved/rejected
+    status = models.CharField(max_length=10, default="pending")  # pending/approved/rejected/reversed
     bill_photo = models.ImageField(upload_to=_bill_path, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     reviewed_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
     reviewed_at = models.DateTimeField(null=True, blank=True)
+    credited_value = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)  # value x boost, set on approval
+    multiplier = models.PositiveSmallIntegerField(default=1)
 
 
 class TaskProgress(models.Model):
@@ -125,9 +163,6 @@ class AuditLog(models.Model):
 
 from datetime import timedelta
 from django.conf import settings
-from django.utils import timezone
-
-
 class Subscription(models.Model):
     owner = models.OneToOneField(User, on_delete=models.CASCADE, related_name="subscription")
     trial_ends = models.DateTimeField()
@@ -151,6 +186,7 @@ class Payment(models.Model):
     order_id = models.CharField(max_length=60, blank=True, db_index=True)
     payment_id = models.CharField(max_length=60, blank=True)
     utr = models.CharField(max_length=20, blank=True, db_index=True)
+    proof = models.ImageField(upload_to=_payment_proof_path, blank=True, storage=PrivateMediaStorage())
     created_at = models.DateTimeField(auto_now_add=True)
 
 
@@ -187,6 +223,7 @@ Payment.add_to_class("invoice_no", models.CharField(max_length=24, blank=True))
 class Vendor(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="vendor")
     code = models.CharField(max_length=10, unique=True)
+    applied_at = models.DateTimeField(default=timezone.now)
     rate = models.DecimalField(max_digits=5, decimal_places=2, default=20)  # % of ex-GST subscription, set by admin
     pan = models.CharField(max_length=10)
     upi_id = models.CharField(max_length=80)
@@ -202,6 +239,8 @@ class Payout(models.Model):
     status = models.CharField(max_length=10, default="pending")  # pending/paid
     reference = models.CharField(max_length=60, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+    tds = models.PositiveIntegerField(default=0)  # paise withheld when marked paid; vendor receives amount - tds
 
 
 class Commission(models.Model):
@@ -251,6 +290,7 @@ PurchaseEntry.add_to_class("far", models.BooleanField(default=False))
 PurchaseEntry.add_to_class("distance_m", models.IntegerField(null=True, blank=True))
 TaskProgress.add_to_class("target", models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True))  # snapshot
 Subscription.add_to_class("rzp_sub_id", models.CharField(max_length=40, blank=True))
+Subscription.add_to_class("rzp_autorenew_active", models.BooleanField(default=False))
 
 
 class OtpCode(models.Model):
@@ -262,3 +302,47 @@ class OtpCode(models.Model):
 
 
 User.add_to_class("consent_at", models.DateTimeField(null=True, blank=True))  # when Terms/Privacy were accepted
+
+
+# ===================== v2: engagement layer =====================
+class Boost(models.Model):
+    """Multiplier events ("double stamps on Tuesdays", "happy hour 3-6pm"). Applies to count/visit tasks."""
+    business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name="boosts")
+    title = models.CharField(max_length=80)
+    multiplier = models.PositiveSmallIntegerField(default=2)
+    weekdays = models.CharField(max_length=13, blank=True)  # "0,1" = Mon,Tue; blank = every day
+    start_time = models.TimeField(null=True, blank=True)
+    end_time = models.TimeField(null=True, blank=True)
+    start = models.DateField(null=True, blank=True)
+    end = models.DateField(null=True, blank=True)
+    active = models.BooleanField(default=True)
+
+
+class Service(models.Model):  # bookable service (haircut, oil change, 1:1 class ...)
+    business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name="services")
+    name = models.CharField(max_length=80)
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    duration_min = models.PositiveIntegerField(default=30)
+    description = models.CharField(max_length=200, blank=True)
+    active = models.BooleanField(default=True)
+
+
+class Booking(models.Model):
+    STATUSES = [("requested", "requested"), ("confirmed", "confirmed"), ("completed", "completed"),
+                ("cancelled", "cancelled"), ("declined", "declined"), ("no_show", "no_show")]
+    profile = models.ForeignKey(CustomerProfile, on_delete=models.CASCADE, related_name="bookings")
+    service = models.ForeignKey(Service, on_delete=models.CASCADE, related_name="bookings")
+    starts_at = models.DateTimeField()
+    status = models.CharField(max_length=10, choices=STATUSES, default="requested")
+    note = models.CharField(max_length=200, blank=True)
+    credited = models.BooleanField(default=False)  # visit credited to the reward programs on completion
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class Feedback(models.Model):
+    profile = models.ForeignKey(CustomerProfile, on_delete=models.CASCADE, related_name="feedback")
+    entry = models.OneToOneField(PurchaseEntry, null=True, blank=True, on_delete=models.SET_NULL, related_name="feedback")
+    booking = models.OneToOneField(Booking, null=True, blank=True, on_delete=models.SET_NULL, related_name="feedback")
+    rating = models.PositiveSmallIntegerField()  # 1..5
+    comment = models.CharField(max_length=300, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
